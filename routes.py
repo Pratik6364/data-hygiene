@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query, Body, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import time
@@ -35,10 +36,14 @@ class DraftRecordRequest(BaseModel):
     cloudprovider: Optional[str] = ""
     benchmarktype: Optional[str] = ""
 
-# Internal Helpers for Draft Workflows
-async def _check_duplicate(db, type_name, value):
-    """Checks if a record with the same type and value already exists in the masterlist."""
-    return await db[MASTERLIST_COL].find_one({"type": type_name, "data.value": value})
+async def _check_duplicate(db, type_name, value, metadata_dict=None):
+    """Checks if a record with the same type, value, and precise metadata already exists in the masterlist."""
+    query = {"type": type_name, "data.value": value}
+    if metadata_dict:
+        for k, v in metadata_dict.items():
+            if v is not None and v != "":
+                query[f"data.metadata.{k}"] = str(v)
+    return await db[MASTERLIST_COL].find_one(query)
 
 def _build_base_ml_doc(type_name, data_content, updated_by: str = ""):
     """Builds the common base structure for a 'In Review' masterlist document with data before history."""
@@ -1410,12 +1415,35 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         raise HTTPException(status_code=400, detail="The 'value' field is required in the request body.")
         
     actual_type = "CPUModel" if type_norm == "cpumodel" else ("instanceType" if type_norm == "instancetype" else type_name)
-    existing = await _check_duplicate(db, actual_type, value)
+    
+    # Extract metadata to check for exact uniqueness
+    metadata_dict = {}
+    if type_norm == "cpumodel":
+        if draft.family: metadata_dict["Family"] = draft.family
+        if draft.corecount: metadata_dict["coreCount"] = draft.corecount
+    elif type_norm == "instancetype":
+        if draft.cpumodel: metadata_dict["CPUModel"] = draft.cpumodel
+        if draft.cloudprovider: metadata_dict["cloudProvider"] = draft.cloudprovider
+        if draft.family: metadata_dict["Family"] = draft.family
+        if draft.corecount: metadata_dict["coreCount"] = draft.corecount
+    elif type_norm == "benchmark":
+        if draft.benchmarktype: metadata_dict["BenchmarkType"] = draft.benchmarktype
+        
+    existing = await _check_duplicate(db, actual_type, value, metadata_dict)
     if existing:
-        return {
-            "status": "error",
-            "message": f"A record for {actual_type} '{value}' already exists in the masterlist (Status: {existing['status']})."
-        }
+        meta_str = ", ".join([f"{k}: '{v}'" for k, v in metadata_dict.items()])
+        msg = f"A record for {actual_type} '{value}'"
+        if meta_str:
+            msg += f" with metadata ({meta_str})"
+        msg += f" already exists in the masterlist (Status: {existing['status']})."
+        
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "error",
+                "message": msg
+            }
+        )
         
     # 2. Build type-specific data content
     data_content = {}
