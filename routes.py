@@ -20,6 +20,7 @@ class ApproveSuggestionRequest(BaseModel):
     field_name: str
     accepted_value: str
     currentStatus: str = "Accepted"
+    coreCount: Optional[str] = None
 
 class RejectRecordRequest(BaseModel):
     execution_id: str
@@ -1204,6 +1205,11 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     if k.lower() == str(meta_name).lower():
                         meta_accepted_value = v
                         break
+                        
+            # --- CUSTOM OVERRIDE FOR CORECOUNT WHEN EDITABLE ---
+            if meta_name == "coreCount" and getattr(req, "coreCount", None) is not None:
+                meta_accepted_value = req.coreCount
+            # ---------------------------------------------------
             
             # Mark metadata as valid (do NOT update the value field in the snapshot)
             meta_item["validation_status"] = "valid"
@@ -1221,7 +1227,8 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             cascaded_changes.append({
                 "field": meta_name,
                 "from": meta_original_value,
-                "to": meta_accepted_value or meta_original_value
+                "to": meta_accepted_value or meta_original_value,
+                "source": "manual" if (meta_name == "coreCount" and getattr(req, "coreCount", None) is not None) else value_source
             })
     
     # 5. Check for Overall Validity (Standardization Status)
@@ -1259,7 +1266,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         new_from.append(change["from"])
         new_to.append(change["to"])
         new_field.append(change["field"])
-        new_source.append(value_source)
+        new_source.append(change.get("source", value_source))
 
     snap_data["history"] = {
         "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
