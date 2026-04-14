@@ -315,14 +315,17 @@ async def get_invalid_summary(
     """
     db = get_db()
     
+    import re
     # 1. Primary Filter on Snapshot collection
     if status:
-        status_filter = status.upper()
-        match_query = {"data.standardization_status": {"$regex": f"^{status_filter}$", "$options": "i"}}
+        status_list = [s.strip() for s in status.split(",") if s.strip()]
+        regex_pattern = "^(" + "|".join(re.escape(s) for s in status_list) + ")$"
+        status_filter = ",".join(status_list).upper()
+        match_query = {"data.standardization_status": {"$regex": regex_pattern, "$options": "i"}}
     else:
         # Default: Include all high-level statuses
         status_filter = "ALL"
-        match_query = {"data.standardization_status": {"$in": ["PENDING", "REJECTED", "ON HOLD", "ACCEPTED"]}}
+        match_query = {"data.standardization_status": {"$regex": "^(PENDING|REJECTED|ON HOLD|ACCEPTED)$", "$options": "i"}}
     
     print(f"API Executing Match Query: {match_query}")
     
