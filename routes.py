@@ -20,7 +20,7 @@ class ApproveSuggestionRequest(BaseModel):
     field_name: str
     accepted_value: str
     currentStatus: str = "Accepted"
-    coreCount: Optional[int] = None
+    coreCount: Optional[str] = None
 
 class RejectRecordRequest(BaseModel):
     execution_id: str
@@ -307,6 +307,7 @@ async def get_invalid_summary_counts():
 async def get_invalid_summary(
     search: Optional[str] = Query(None, description="Search by Execution ID, Benchmark Type, or Category"),
     status: Optional[str] = Query(None, description="Filter by status: PENDING, REJECTED, ACCEPTED, 'On Hold'. Defaults to ALL if not provided."),
+    age: Optional[str] = Query(None, description="Filter by age: green, yellow, or red"),
     page: int = Query(1, ge=1), 
     size: int = Query(50, ge=1, le=500)
 ):
@@ -358,10 +359,39 @@ async def get_invalid_summary(
 
     skip_count = (page - 1) * size
     
+    # Optional Age Filtering logic
+    age_filter_stages = []
+    if age:
+        age_filter_stages = [
+            {"$addFields": {
+                "updatedOn": {"$arrayElemAt": ["$data.history.updatedOn", 0]}
+            }},
+            {"$match": {"updatedOn": {"$type": "string"}}},
+            {"$addFields": {
+                "now": datetime.utcnow(),
+                "dt": {"$dateFromString": {"dateString": "$updatedOn", "onError": None}}
+            }},
+            {"$match": {"dt": {"$ne": None}}},
+            {"$addFields": {
+                "diffDays": {
+                    "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
+                }
+            }}
+        ]
+        
+        target_age = str(age).strip().lower()
+        if target_age == "green":
+            age_filter_stages.append({"$match": {"diffDays": {"$lt": 3}}})
+        elif target_age == "yellow":
+            age_filter_stages.append({"$match": {"diffDays": {"$gte": 3, "$lte": 6}}})
+        elif target_age == "red":
+            age_filter_stages.append({"$match": {"diffDays": {"$gt": 6}}})
+            
     # 2. Extract Data (Use $lookup to join with ExecutionInfo for guaranteed metadata)
     invalid_records = []
     pipeline = [
-        {"$match": match_query},
+        {"$match": match_query}
+    ] + age_filter_stages + [
         {"$sort": {"_id": -1}},
         {"$skip": skip_count},
         {"$limit": size},
@@ -407,8 +437,13 @@ async def get_invalid_summary(
         invalid_records.append(record)
 
     # 3. Total Count Logic
-    if search or status_filter != "PENDING":
-        total_records = await db[SNAPSHOT_COL].count_documents(match_query)
+    if search or status_filter != "PENDING" or age:
+        if age:
+            count_pipeline = [{"$match": match_query}] + age_filter_stages + [{"$count": "total"}]
+            count_res = await db[SNAPSHOT_COL].aggregate(count_pipeline).to_list(length=1)
+            total_records = count_res[0]["total"] if count_res else 0
+        else:
+            total_records = await db[SNAPSHOT_COL].count_documents(match_query)
     else:
         global _report_cache
         if _report_cache["total_invalid"]["value"] is None or (time.time() - _report_cache["total_invalid"]["updated_at"]) > CACHE_TTL:
@@ -416,53 +451,9 @@ async def get_invalid_summary(
             _report_cache["total_invalid"]["updated_at"] = time.time()
         total_records = _report_cache["total_invalid"]["value"]
     
-    # 4. Aging Counts (Red/Yellow/Green)
-    counts = {"red": 0, "yellow": 0, "green": 0}
-    if (search and search.strip()) or status_filter != "ALL":
-        # Dynamic aging counts for the current search or status filter
-        counts = {"red": 0, "yellow": 0, "green": 0}
-        count_agg = [
-            {"$match": match_query},
-            {"$addFields": {
-                # Accessing the first history timestamp safely from the data array
-                "updatedOn": {"$arrayElemAt": ["$data.history.updatedOn", 0]}
-            }},
-            # Ensure the field exists and is a valid string before attempting to parse it as a date
-            {"$match": {"updatedOn": {"$type": "string"}}},
-            {"$addFields": {
-                "now": datetime.utcnow(),
-                "dt": {"$dateFromString": {"dateString": "$updatedOn", "onError": None}}
-            }},
-            # Filter out any records where date parsing failed
-            {"$match": {"dt": {"$ne": None}}},
-            {"$addFields": {
-                "diffDays": {
-                    "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
-                }
-            }},
-            {"$group": {
-                "_id": {
-                    "$cond": [
-                        {"$lt": ["$diffDays", 3]}, "green",
-                        {"$cond": [{"$lte": ["$diffDays", 6]}, "yellow", "red"]}
-                    ]
-                },
-                "count": {"$sum": 1}
-            }}
-        ]
-        async for result_doc in db[SNAPSHOT_COL].aggregate(count_agg):
-            if result_doc["_id"] in counts:
-                counts[result_doc["_id"]] = result_doc["count"]
-    else:
-        # Global cached counts for the default view
-        counts = await get_invalid_summary_counts()
-        
     return {
         "status": "success",
         "total_invalid_records": total_records,
-        "red": counts["red"],
-        "yellow": counts["yellow"],
-        "green": counts["green"],
         "page": page,
         "size": size,
         "returned_records": len(invalid_records),
@@ -667,6 +658,39 @@ async def get_validation_counts():
     
     return response_payload
 
+_datatype_cache = {}
+
+async def _infer_datatype(db, field_path: str) -> str:
+    """Helper to dynamically infer INTEGER vs STRING based on historical ExecutionInfo."""
+    global _datatype_cache
+    if not field_path:
+        return "STRING"
+        
+    if field_path in _datatype_cache:
+        return _datatype_cache[field_path]
+        
+    unique_values = await db[EXECUTION_INFO_COL].distinct(field_path)
+    has_valid_values = False
+    
+    for val in unique_values:
+        if val is None:
+            continue
+            
+        val_str = str(val).strip()
+        if val_str == "" or val_str.lower() == "none" or val_str.lower() == "nan":
+            continue
+            
+        has_valid_values = True
+        try:
+            int(val_str)
+        except ValueError:
+            _datatype_cache[field_path] = "STRING"
+            return "STRING"
+            
+    res = "INTEGER" if has_valid_values else "STRING"
+    _datatype_cache[field_path] = res
+    return res
+
 async def get_masterlist_mappings(field_type: str) -> dict:
     """
     Helper to fetch mapping definitions from the masterlist for a specific field type.
@@ -779,17 +803,26 @@ async def get_snapshot_records(Execution_id: str):
         
         # 1. Build existing_data for this field (primary field + metadata)
         field_existing_data = []
+        
+        primary_mapping = meta.get("mapping") or type_mappings[field_name].get("mapping", "")
+        primary_dt = await _infer_datatype(db, primary_mapping)
+        
         field_existing_data.append({
             "field": field_name,
             "value": val,
-            "validation_status": meta.get("validation_status")
+            "validation_status": meta.get("validation_status"),
+            "datatype": primary_dt
         })
         
         for support in meta.get("metadata", []):
+            support_mapping = support.get("mapping") or type_mappings[field_name].get("metadata_mappings", {}).get(support.get("name"), "")
+            support_dt = await _infer_datatype(db, support_mapping)
+            
             field_existing_data.append({
                 "field": support.get("name"),
                 "value": support.get("value"),
-                "validation_status": support.get("validation_status")
+                "validation_status": support.get("validation_status"),
+                "datatype": support_dt
             })
             
         # 2. Build suggestions for this field (grouped by masterlist record)
@@ -1087,6 +1120,19 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
     - If the accepted_value doesn't match any suggestion (dropdown selection), ALL suggestions are 'Rejected'.
     Updates the snapshot status and propagates the accepted value to the original Executioninfo record.
     """
+    
+    if req.coreCount is not None:
+        try:
+            int(str(req.coreCount).strip())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error", 
+                    "message": f"Field 'coreCount' has the wrong input format. Expected a valid integer, but got: '{req.coreCount}'"
+                }
+            )
+            
     db = get_db()
     
     # 1. Fetch Snapshot
@@ -1462,6 +1508,18 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
     value = draft.value
     if not value:
         raise HTTPException(status_code=400, detail="The 'value' field is required in the request body.")
+        
+    if draft.corecount and str(draft.corecount).strip() != "":
+        try:
+            int(str(draft.corecount).strip())
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error", 
+                    "message": f"Field 'coreCount' has the wrong input format. Expected a valid integer, but got: '{draft.corecount}'"
+                }
+            )
         
     actual_type = "CPUModel" if type_norm == "cpumodel" else ("instanceType" if type_norm == "instancetype" else type_name)
     
