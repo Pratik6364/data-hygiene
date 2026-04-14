@@ -1469,15 +1469,32 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
     # If a specific execution_id was provided, prioritize it
     update_filter = {"execution_id": draft.execution_id} if draft.execution_id else {"data.invalidValues.value": value}
     
-    await db[SNAPSHOT_COL].update_many(
-        update_filter,
-        {"$set": {
-            "data.0.standardization_status": "ON HOLD",
-            "data.0.reason": "New Masterlist Draft Record.",
-            "data.0.invalidValues.$[elem].currentStatus": "ON HOLD"
-        }},
-        array_filters=[{"elem.field": {"$regex": f"^{actual_type}$", "$options": "i"}}]
-    )
+    cursor = db[SNAPSHOT_COL].find(update_filter)
+    async for snap in cursor:
+        updated = False
+        if "data" in snap and isinstance(snap["data"], list) and len(snap["data"]) > 0:
+            data_dict = snap["data"][0]
+            data_dict["standardization_status"] = "ON HOLD"
+            data_dict["reason"] = "New Masterlist Draft Record."
+            
+            for item in data_dict.get("invalidValues", []):
+                # Update statuses for the drafted field
+                if str(item.get("field")).lower() == actual_type.lower():
+                    item["currentStatus"] = "ON HOLD"
+                    
+                    # Reject all primary fuzzy suggestions
+                    for cmp in item.get("comparingData", []):
+                        cmp["status"] = "REJECTED"
+                        
+                    # Reject all metadata fuzzy suggestions
+                    for meta in item.get("metadata", []):
+                        for cmp in meta.get("comparingData", []):
+                            cmp["status"] = "REJECTED"
+                            
+                    updated = True
+        
+        if updated:
+            await db[SNAPSHOT_COL].replace_one({"_id": snap["_id"]}, snap)
     
     return {
         "status": "success",

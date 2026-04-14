@@ -13,8 +13,7 @@ CONDITIONAL_RULES = {
     "CPUModel": {"field": "sutInstanceMetadata.sutType", "condition": "not_equals", "value": "cloud"},
     "instanceType": {"field": "sutInstanceMetadata.sutType", "condition": "equals", "value": "cloud"}
 }
- 
- 
+
 async def build_mappings() -> Dict[str, str]:
     """
     Dynamically builds the MAPPINGS dict from the masterlist collection.
