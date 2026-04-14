@@ -198,7 +198,16 @@ async def get_invalid_records(
     invalid_records = []
     async for doc in db[EXECUTION_INFO_COL].aggregate(pipeline):
         invalid_payloads = doc.get("invalidPayload", [])
-        invalid_fields = [p.get("field") for p in invalid_payloads if p.get("field")]
+        
+        # Traverse top level payload and metadata to collect ALL invalid fields dynamically
+        invalid_fields_set = set()
+        for p in invalid_payloads:
+            if p.get("validation_status") == "invalid" and p.get("field"):
+                invalid_fields_set.add(p["field"])
+            for m in p.get("metadata", []):
+                if m.get("validation_status") == "invalid" and m.get("name"):
+                    invalid_fields_set.add(m["name"])
+        invalid_fields = sorted(list(invalid_fields_set))
         
         record = {
             "ExecutionId": doc["_id"],
@@ -277,11 +286,11 @@ async def get_invalid_summary_counts():
         try:
             # Parse the timestamp e.g. '2026-03-27T15:18:14.632228Z'
             dt = datetime.strptime(updated_on_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-            delta_days = (now - dt).days
+            delta_days = (now - dt).total_seconds() / 86400.0
             
             if delta_days < 3:
                 counts["green"] += 1
-            elif 3 <= delta_days <= 6:
+            elif delta_days <= 6:
                 counts["yellow"] += 1
             else:
                 counts["red"] += 1
@@ -424,9 +433,7 @@ async def get_invalid_summary(
             {"$match": {"dt": {"$ne": None}}},
             {"$addFields": {
                 "diffDays": {
-                    "$floor": {
-                        "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
-                    }
+                    "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
                 }
             }},
             {"$group": {
@@ -582,8 +589,8 @@ async def get_validation_counts():
         facet_dict[t] = [
             {"$group": {
                 "_id": None,
-                "valid":   {"$sum": {"$cond": [{"$in": [t, "$invalidPayload.field"]}, 0, 1]}},
-                "invalid": {"$sum": {"$cond": [{"$in": [t, "$invalidPayload.field"]}, 1, 0]}},
+                "valid":   {"$sum": {"$cond": [{"$in": [t, {"$ifNull": ["$all_invalid_fields", []]}]}, 0, 1]}},
+                "invalid": {"$sum": {"$cond": [{"$in": [t, {"$ifNull": ["$all_invalid_fields", []]}]}, 1, 0]}},
             }}
         ]
         
@@ -593,6 +600,38 @@ async def get_validation_counts():
         {"$group": {
             "_id": "$benchmarkExecutionID",
             "invalidPayload": {"$first": "$invalidPayload"}
+        }},
+        {"$addFields": {
+            "all_invalid_fields": {
+                "$reduce": {
+                    "input": {
+                        "$map": {
+                            "input": {"$ifNull": ["$invalidPayload", []]},
+                            "as": "p",
+                            "in": {
+                                "$concatArrays": [
+                                    {"$cond": [{"$eq": ["$$p.validation_status", "invalid"]}, ["$$p.field"], []]},
+                                    {
+                                        "$map": {
+                                            "input": {
+                                                "$filter": {
+                                                    "input": {"$ifNull": ["$$p.metadata", []]},
+                                                    "as": "m",
+                                                    "cond": {"$eq": ["$$m.validation_status", "invalid"]}
+                                                }
+                                            },
+                                            "as": "m_valid",
+                                            "in": "$$m_valid.name"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "initialValue": [],
+                    "in": {"$concatArrays": ["$$value", "$$this"]}
+                }
+            }
         }},
         {"$facet": facet_dict}
     ]
@@ -1504,6 +1543,12 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
             data_dict = snap["data"][0]
             data_dict["standardization_status"] = "ON HOLD"
             data_dict["reason"] = "New Masterlist Draft Record."
+            
+            # Update Timestamp in history
+            if "history" not in data_dict or not isinstance(data_dict["history"], dict):
+                data_dict["history"] = {}
+            data_dict["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            data_dict["history"]["updatedBy"] = "xxx@amd.com"
             
             for item in data_dict.get("invalidValues", []):
                 # Update statuses for the drafted field
