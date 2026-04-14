@@ -20,7 +20,7 @@ class ApproveSuggestionRequest(BaseModel):
     field_name: str
     accepted_value: str
     currentStatus: str = "Accepted"
-    coreCount: Optional[str] = None
+    coreCount: Optional[int] = None
 
 class RejectRecordRequest(BaseModel):
     execution_id: str
