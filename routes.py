@@ -422,6 +422,17 @@ async def get_invalid_summary(
                                   exec_info.get("benchmarkCategory", "N/A"))
         }
         
+        # Count only PENDING (available) record-level suggestions.
+        # Rejected/Accepted suggestions are excluded — matching what the UI shows as "available".
+        suggestions_count = 0
+        for val_item in first_data.get("invalidValues", []):
+            suggestions_count += sum(
+                1 for s in val_item.get("comparingData", [])
+                if str(s.get("status", "")).upper() == "PENDING"
+            )
+        
+        record["SuggestionsCount"] = suggestions_count
+
         # Collect all invalid fields: primary fields + metadata fields that are invalid
         invalid_fields = set()
         for val_item in first_data.get("invalidValues", []):

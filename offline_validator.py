@@ -6,7 +6,34 @@ from utils import get_nested_value
 import uuid
 from datetime import datetime, timezone
 import collections
- 
+
+_datatype_cache = {}
+
+async def _infer_datatype(db, field_path: str) -> str:
+    """Determines if a field is INTEGER or STRING based on all historical ExecutionInfo values."""
+    if not field_path:
+        return "STRING"
+    if field_path in _datatype_cache:
+        return _datatype_cache[field_path]
+    
+    unique_values = await db['Executioninfo'].distinct(field_path)
+    has_valid = False
+    for val in unique_values:
+        if val is None:
+            continue
+        val_str = str(val).strip()
+        if val_str == "" or val_str.lower() in ("none", "nan"):
+            continue
+        has_valid = True
+        try:
+            int(val_str)
+        except ValueError:
+            _datatype_cache[field_path] = "STRING"
+            return "STRING"
+    result = "INTEGER" if has_valid else "STRING"
+    _datatype_cache[field_path] = result
+    return result
+
 async def main():
     db = get_db()
    
@@ -89,12 +116,16 @@ async def main():
                 field = p.get("field")
                 val = p.get("value")
                 
+                primary_mapping = p.get("mapping", "")
+                primary_dt = await _infer_datatype(db, primary_mapping)
+                
                 p_clean = {
                     "field": field,
                     "currentStatus": "invalid",
                     "value": val,
                     "validation_status": p.get("validation_status", "invalid"),
-                    "mapping": p.get("mapping", "")
+                    "mapping": primary_mapping,
+                    "datatype": primary_dt
                 }
                 actual_meta_vals = {m["name"]: m.get("value", "") for m in p.get("metadata", []) if m.get("name")}
                 
@@ -115,6 +146,8 @@ async def main():
                 meta_list = []
                 for m in p.get("metadata", []):
                     m_clean = dict(m)
+                    meta_mapping = m.get("mapping", "")
+                    m_clean["datatype"] = await _infer_datatype(db, meta_mapping)
                     m_comparing = []
                     m_name = m_clean.get("name")
                     for i, rec_sug in enumerate(record_suggestions, 1):
