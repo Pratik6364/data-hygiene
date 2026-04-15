@@ -1703,3 +1703,4 @@ async def get_draft_record_fields(type: str = Query(..., description="Record typ
         "type": type_lower,
         "fields": _DRAFT_FIELDS_MAP[type_lower]
     }
+    
