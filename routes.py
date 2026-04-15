@@ -46,10 +46,10 @@ async def _check_duplicate(db, type_name, value, metadata_dict=None):
                 query[f"data.metadata.{k}"] = str(v)
     return await db[MASTERLIST_COL].find_one(query)
 
-def _build_base_ml_doc(type_name, data_content, updated_by: str = ""):
+def _build_base_ml_doc(type_name, data_content, updated_by: str = "", execution_id: str = None):
     """Builds the common base structure for a 'In Review' masterlist document with data before history."""
     now = datetime.utcnow()
-    return {
+    doc = {
         "`_id`": str(uuid.uuid4()),
         "type": type_name,
         "status": "Draft",
@@ -61,6 +61,9 @@ def _build_base_ml_doc(type_name, data_content, updated_by: str = ""):
             "valueField": None
         }
     }
+    if execution_id:
+        doc["execution_id"] = execution_id
+    return doc
 
 async def resolve_fuzzy_benchmarks(benchmarkType: str = None, benchmarkCategory: str = None):
     """
@@ -863,11 +866,38 @@ async def get_snapshot_records(Execution_id: str):
                 sug_entry[m_name.lower()] = m_val
             field_suggestions.append(sug_entry)
             
+        # 2b. Fetch DRAFT record specifically sent for this execution (Single Object)
+        draft_record = None
+        draft_doc = await db[MASTERLIST_COL].find_one({
+            "status": "Draft",
+            "type": {"$regex": f"^{field_name}$", "$options": "i"},
+            "$or": [
+                {"execution_id": Execution_id},
+                {"`_id`": Execution_id}
+            ]
+        })
+        
+        if draft_doc:
+            d_data = draft_doc.get("data", {})
+            d_val = d_data.get("value")
+            draft_record = {
+                field_name.lower(): d_val,
+                "status": "Draft",
+                "_id": draft_doc.get("`_id`") or str(draft_doc.get("_id"))
+            }
+            # Flatten metadata
+            d_meta = d_data.get("metadata", {})
+            if isinstance(d_meta, dict):
+                for mk, mv in d_meta.items():
+                    if not mk.startswith("mapping"):
+                        draft_record[mk.lower()] = mv
+            
         data_list.append({
             "invalid_field": field_name,
             "currentStatus": meta.get("currentStatus", "invalid"),
             "existing_data": field_existing_data,
-            "suggestions": field_suggestions
+            "suggestions": field_suggestions,
+            "draft_records": draft_record
         })
     
     # Restructure history into changes array
@@ -1607,7 +1637,7 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         }
         
     # 3. Final Document Construction (Type before Status, Data before History)
-    ml_doc = _build_base_ml_doc(actual_type, data_content, "")
+    ml_doc = _build_base_ml_doc(actual_type, data_content, "", draft.execution_id)
     
     await db[MASTERLIST_COL].insert_one(ml_doc)
     
